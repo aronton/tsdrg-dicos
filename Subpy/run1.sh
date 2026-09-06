@@ -6,21 +6,60 @@
 #SBATCH --output=replace4
 #SBATCH --requeue
 
+set -o pipefail
 
 source ~/.bashrc
 
-date
+echo "Job started: $(date)"
 
-FILE=$1
-outputPath="replace4"
+# ============================================================
+# 讀取命令列參數
+#
+# $1：參數檔
+# $2：是否使用 Slurm，預設 true
+# $3：從第幾輪繼續，預設 0
+# ============================================================
 
-# 原始腳本絕對路徑
+if [[ -z "${1:-}" ]]; then
+    echo "錯誤：請提供參數檔。" >&2
+    echo "用法：$0 parameter.txt [true|false] [restart_round]" >&2
+    exit 1
+fi
+
+if [[ ! -f "$1" ]]; then
+    echo "錯誤：參數檔 '$1' 不存在。" >&2
+    exit 1
+fi
+
+# 必須在 cd 前轉成絕對路徑
+FILE="$(readlink -f "$1")"
+
+use_slurm="${2:-true}"
+restart_round="${3:-0}"
+
+case "$use_slurm" in
+    true|false)
+        ;;
+    *)
+        echo "錯誤：use_slurm 必須是 true 或 false，目前為：$use_slurm" >&2
+        exit 1
+        ;;
+esac
+
+if ! [[ "$restart_round" =~ ^[0-9]+$ ]]; then
+    echo "錯誤：restart_round 必須是非負整數，目前為：$restart_round" >&2
+    exit 1
+fi
+
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 
-# 保留原本傳進來的參數
-ORIG_ARGS=("$@")
+echo "parameter file : $FILE"
+echo "use_slurm      : $use_slurm"
+echo "restart_round  : $restart_round"
 
-#!/bin/bash
+# ============================================================
+# 判斷執行環境
+# ============================================================
 
 scopionPath="/home/aronton/tSDRG_random"
 dicosPath="/ceph/work/NTHU-qubit/LYT/tSDRG_random"
@@ -29,237 +68,348 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 
-
-if [ -d "${scopionPath}/tSDRG/Main_15" ]; then
-    tSDRGpath="${scopionPath}"
-    cd "${tSDRGpath}/tSDRG/Main_15"
-    echo "working on scopion"
-
-elif [ -d "${dicosPath}/tSDRG/Main_15" ]; then
-    tSDRGpath="${dicosPath}"
-    cd "${tSDRGpath}/tSDRG/Main_15"
-    echo "working on dicos"
+if [[ -d "${scopionPath}/tSDRG/Main_15" ]]; then
+    tSDRGpath="$scopionPath"
+    cluster_name="scopion"
+elif [[ -d "${dicosPath}/tSDRG/Main_15" ]]; then
+    tSDRGpath="$dicosPath"
+    cluster_name="dicos"
 else
-    echo "❌ 找不到 Main_15 目錄！"
+    echo "錯誤：找不到 tSDRG/Main_15 目錄。" >&2
     exit 1
 fi
-echo "📁 當前工作路徑：$(pwd)"
-# 讀取 eee 檔案並解析 s1, s2, ds
-while IFS=: read -r key value; do
-    value=$(echo "$value" | xargs)  # 去除前後空白
-    if [[ "$key" == "s1" ]]; then
-        s1=$value
-    elif [[ "$key" == "s2" ]]; then
-        s2=$value
-    elif [[ "$key" == "ds" ]]; then
-        ds=$value
-    fi
+
+if ! cd "${tSDRGpath}/tSDRG/Main_15"; then
+    echo "錯誤：無法進入 ${tSDRGpath}/tSDRG/Main_15" >&2
+    exit 1
+fi
+
+echo "working on       : $cluster_name"
+echo "working directory: $PWD"
+
+# ============================================================
+# 讀取參數檔
+# ============================================================
+
+s1=""
+s2=""
+ds=""
+task=""
+
+while IFS=: read -r key value || [[ -n "$key" ]]; do
+    # 移除 key/value 前後空白
+    key="$(echo "$key" | xargs)"
+    value="$(echo "${value:-}" | xargs)"
+
+    case "$key" in
+        s1)
+            s1="$value"
+            ;;
+        s2)
+            s2="$value"
+            ;;
+        ds)
+            ds="$value"
+            ;;
+        task)
+            task="$value"
+            ;;
+    esac
 done < "$FILE"
 
-echo "parameterfile : $FILE"
-echo "The working directory : $PWD"
-
-if [[ -n "${3:-}" ]]; then
-    restart_round="$3"
-else
-    restart_round=0
+if [[ -z "$s1" || -z "$s2" || -z "$ds" ]]; then
+    echo "錯誤：s1、s2 或 ds 讀取失敗。" >&2
+    echo "讀取結果：s1='$s1', s2='$s2', ds='$ds'" >&2
+    exit 1
 fi
 
-echo "restart_round=$restart_round"
-
-# 全域變數控制是否使用 Slurm 排程、是否印出指令
-use_slurm=$2
-use_slurm="true"
-if [ "$use_slurm" == true ]; then
-    echo "use_slurm : $use_slurm"
+if ! [[ "$s1" =~ ^[0-9]+$ &&
+        "$s2" =~ ^[0-9]+$ &&
+        "$ds" =~ ^[1-9][0-9]*$ ]]; then
+    echo "錯誤：s1、s2 必須是非負整數，ds 必須是正整數。" >&2
+    echo "目前數值：s1=$s1, s2=$s2, ds=$ds" >&2
+    exit 1
 fi
-run_and_print() {
-    local cmd=("$@")  # 將傳入的所有參數組成陣列
 
-    if $use_slurm; then
-        srun --ntasks=1 --nodes=1 --cpus-per-task=1 --exclusive "${cmd[@]}"
-        if $print_cmd; then
-            echo "[執行指令] srun --ntasks=1 --nodes=1 --cpus-per-task=1 --exclusive ${cmd[*]}"
-        fi
-    else
-        "${cmd[@]}"
-        if $print_cmd; then
-            echo "[執行指令] ${cmd[*]}"
-        fi
-    fi
-}
+if (( s2 < s1 )); then
+    echo "錯誤：s2=$s2 小於 s1=$s1。" >&2
+    exit 1
+fi
+
+# sample 總數
+sample_count=$((s2 - s1 + 1))
+
+# 向上取整，確保最後不足 ds 個 samples 的輪次不會漏掉
+cols=$(((sample_count + ds - 1) / ds))
+rows=$ds
+
+echo "task=$task"
+echo "s1=$s1, s2=$s2, ds=$ds"
+echo "sample_count=$sample_count"
+echo "total_rounds=$cols"
+
+if (( restart_round >= cols )); then
+    echo "restart_round=$restart_round 已超過總輪數 $cols，沒有工作需要執行。"
+    exit 0
+fi
+
+# ============================================================
+# Slurm 剩餘時間轉成秒
+#
+# 支援：
+#   MM:SS
+#   HH:MM:SS
+#   D-HH:MM:SS
+#   UNLIMITED
+# ============================================================
 
 time_to_seconds() {
-    local t="$1"
-    local d=0 h=0 m=0 s=0
+    local time_string="$1"
+    local days=0
+    local hours=0
+    local minutes=0
+    local seconds=0
+    local part_count
 
-    if [[ -z "$t" || "$t" == "NOT_SET" ]]; then
-        echo 0
+    if [[ -z "$time_string" || "$time_string" == "NOT_SET" ||
+          "$time_string" == "N/A" ]]; then
+        echo -2
         return
     fi
 
-    if [[ "$t" == "UNLIMITED" ]]; then
+    if [[ "$time_string" == "UNLIMITED" ]]; then
         echo -1
         return
     fi
 
-    if [[ "$t" == *-* ]]; then
-        d=${t%%-*}
-        t=${t#*-}
+    if [[ "$time_string" == *-* ]]; then
+        days="${time_string%%-*}"
+        time_string="${time_string#*-}"
     fi
 
-    IFS=: read -r h m s <<< "$t"
+    part_count=$(awk -F: '{print NF}' <<< "$time_string")
 
-    echo $((10#$s + 60*(10#$m + 60*(10#$h + 24*10#$d))))
+    case "$part_count" in
+        3)
+            IFS=: read -r hours minutes seconds <<< "$time_string"
+            ;;
+        2)
+            IFS=: read -r minutes seconds <<< "$time_string"
+            ;;
+        1)
+            seconds="$time_string"
+            ;;
+        *)
+            echo -2
+            return
+            ;;
+    esac
+
+    echo $(
+        (10#$seconds) +
+        60 * (
+            (10#$minutes) +
+            60 * (
+                (10#$hours) +
+                24 * (10#$days)
+            )
+        )
+    )
 }
 
+# ============================================================
+# 執行
+# ============================================================
 
-# 檢查是否提供了檔案名稱作為參數
-if [ -z "$1" ]; then
-    echo "請提供要讀取的 .txt 檔案名稱作為參數。"
-    echo "用法：$0 檔案名稱.txt"
-    exit 1
-fi
+if [[ "$task" == "submit" ]]; then
 
-# 檢查指定的檔案是否存在
-if [ ! -f "$FILE" ]; then
-    echo "檔案 '$FILE' 不存在。"
-    exit 1
-fi
-
-# 逐行讀取並顯示檔案內容
-task=""
-
-while IFS= read -r line || [ -n "$line" ]; do
-    IFS=':' read -r part1 part2 <<< "$line"
-
-    echo "$line"
-
-    if [ "$part1" == "task" ]; then
-        task="$part2"
-        echo "✅ 偵測到 'task'，設定 task=$task"
-    fi
-
-done < "$FILE"
-
-
-
-# 確保變數都有值
-if [[ -z "$s1" || -z "$s2" || -z "$ds" ]]; then
-    echo "錯誤: s1, s2, ds 讀取失敗！"
-    exit 1
-fi
-
-# 計算分組數量
-cols=$(((s2 - s1 + 1) / ds ))
-echo "s1: $s1, s2: $s2, ds: $ds, cols: $cols"
-# 定義行數與列數
-rows=$ds
-# cols=$((s2/ds))
-echo
-echo -e "$rows"
-echo -e "$cols"
-# 初始化二維陣列（用一維陣列模擬）
-# array=()
-if [ "$task" == "submit" ]; then
-    # === 一次 srun 並行（非 MPI），每輪只一個 step，所有輸出進 #SBATCH --output ===
-    round_times=()          # 每一輪花費時間
-    total_time=0            # 總時間
-    current_round=-1        # 目前正在跑第幾輪
-    last_completed_round=-1 # 已完成到第幾輪
+    total_time=0
+    completed_in_this_job=0
+    last_completed_round=$((restart_round - 1))
 
     for ((i=restart_round; i<cols; i++)); do
 
-        current_round=$i
-
-        # 用「已完成輪次」來算平均
-        if (( i > 0 )); then
-            avg_time=$(( total_time / i ))
+        # 只有本次 job 已完成至少一輪，才使用平均時間
+        if (( completed_in_this_job > 0 )); then
+            avg_time=$((total_time / completed_in_this_job))
         else
             avg_time=0
         fi
 
-        remaining_time=$(squeue -h -j "$SLURM_JOB_ID" -o "%L")
-        remaining_sec=$(time_to_seconds "$remaining_time")
-
-        # 若查不到剩餘時間，可自行決定要不要直接停
-        if (( remaining_sec < 0 )); then
-            echo "Warning: 無法取得剩餘時間，停止開新輪次。"
-            break
+        # 有 SLURM_JOB_ID 才能查詢剩餘時間
+        if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+            remaining_time="$(
+                squeue -h -j "$SLURM_JOB_ID" -o "%L" 2>/dev/null |
+                head -n 1
+            )"
+            remaining_sec="$(time_to_seconds "$remaining_time")"
+        else
+            remaining_time="NOT_IN_SLURM"
+            remaining_sec=-2
         fi
 
-        required_time=$(( avg_time + 600 ))   # 平均時間 + 10 分鐘 buffer
+        required_time=$((avg_time + 600))
 
-        echo "Round${i}: remaining_sec=${remaining_sec}, remaining_time=${remaining_time}s, avg_time=${avg_time}s, required_time=${required_time}s"
+        echo
+        echo "================================================"
+        echo "Round $i / $((cols - 1))"
+        echo "remaining_time=$remaining_time"
+        echo "remaining_sec=$remaining_sec"
+        echo "avg_time=$avg_time"
+        echo "required_time=$required_time"
+        echo "================================================"
 
-        # 第 0 輪沒有平均值，可選擇直接跑；從第 1 輪開始嚴格檢查
-        if (( i > 0 && remaining_sec <= required_time )); then
-            echo "剩餘時間不足，不再啟動下一輪。"
-            # 避免 export 設定被污染
+        # remaining_sec == -1 代表 UNLIMITED，不需要續投
+        # remaining_sec == -2 代表查詢失敗，保守停止並續投
+        should_resubmit=false
+
+        if (( completed_in_this_job > 0 )); then
+            if (( remaining_sec == -2 )); then
+                echo "警告：無法取得 Slurm 剩餘時間，準備續投。"
+                should_resubmit=true
+            elif (( remaining_sec >= 0 &&
+                    remaining_sec <= required_time )); then
+                echo "剩餘時間不足，不再啟動 Round $i。"
+                should_resubmit=true
+            fi
+        fi
+
+        if [[ "$should_resubmit" == "true" ]]; then
+
             export SLURM_EXPORT_ENV=ALL
-            sbatch --export=ALL \
-                "$SCRIPT_PATH" "$FILE" "$use_slurm" "$current_round"
 
+            submit_output="$(
+                sbatch --export=ALL \
+                    "$SCRIPT_PATH" \
+                    "$FILE" \
+                    "$use_slurm" \
+                    "$i" 2>&1
+            )"
             rc=$?
-            # sbatch --export=ALL \
-            #     "$SCRIPT_PATH" "${ORIG_ARGS[@]}" "${current_round}"
+
+            echo "$submit_output"
             echo "last_completed_round=$last_completed_round"
+            echo "next_restart_round=$i"
 
             if (( rc != 0 )); then
-                echo "Error: 重新提交失敗，sbatch rc=$rc" >&2
-                exit $rc
+                echo "錯誤：重新提交失敗，sbatch rc=$rc" >&2
+                exit "$rc"
             fi
 
-            echo "重新提交成功，當前 job 結束。"
+            echo "重新提交成功，目前 job 正常結束。"
             exit 0
         fi
 
-        start=$SECONDS
-        echo -e "Round${i} start ${start}\n"
+        start_time=$SECONDS
 
-        start_idx=$(( s1 + i*rows ))
-        end_idx=$(( start_idx + rows - 1 ))
+        start_idx=$((s1 + i * rows))
+        end_idx=$((start_idx + rows - 1))
+
         if (( end_idx > s2 )); then
             end_idx=$s2
         fi
-        GROUP_SIZE=$(( end_idx - start_idx + 1 ))
 
-        # 傳遞給子任務
-        export FILE start_idx
+        group_size=$((end_idx - start_idx + 1))
 
-        srun --mpi=none -n "${GROUP_SIZE}" -c 1 --cpu-bind=cores --distribution=block:block --mem-bind=local bash -lc '
-        p=$(( start_idx + SLURM_PROCID ))
-        exec ./spin15_run160316.exe "$FILE" "$p" "$p"
-        '
+        echo "Round $i started: $(date)"
+        echo "sample range: $start_idx-$end_idx"
+        echo "group_size=$group_size"
 
+        export FILE
+        export start_idx
 
-        python "${tSDRGpath}/Subpy/combine.py" "${FILE}" "${start_idx}" "${end_idx}"
-        python "${tSDRGpath}/Subpy/ave.py"     "${FILE}" "${start_idx}" "${end_idx}"
+        if [[ "$use_slurm" == "true" ]]; then
 
-        elapsed=$(( SECONDS - start ))
-        round_times[i]=$elapsed
-        total_time=$(( total_time + elapsed ))
+            srun --mpi=none \
+                --ntasks="$group_size" \
+                --cpus-per-task=1 \
+                --cpu-bind=cores \
+                --distribution=block:block \
+                bash -lc '
+                    p=$((start_idx + SLURM_PROCID))
+                    exec ./spin15_run160316.exe "$FILE" "$p" "$p"
+                '
+
+            run_rc=$?
+
+        else
+            run_rc=0
+
+            for ((p=start_idx; p<=end_idx; p++)); do
+                ./spin15_run160316.exe "$FILE" "$p" "$p" &
+            done
+
+            wait || run_rc=$?
+        fi
+
+        if (( run_rc != 0 )); then
+            echo "錯誤：Round $i 計算失敗，rc=$run_rc。" >&2
+            echo "這一輪不會標記成已完成。" >&2
+            exit "$run_rc"
+        fi
+
+        python "${tSDRGpath}/Subpy/combine.py" \
+            "$FILE" "$start_idx" "$end_idx"
+        combine_rc=$?
+
+        if (( combine_rc != 0 )); then
+            echo "錯誤：Round $i combine.py 執行失敗。" >&2
+            exit "$combine_rc"
+        fi
+
+        python "${tSDRGpath}/Subpy/ave.py" \
+            "$FILE" "$start_idx" "$end_idx"
+        ave_rc=$?
+
+        if (( ave_rc != 0 )); then
+            echo "錯誤：Round $i ave.py 執行失敗。" >&2
+            exit "$ave_rc"
+        fi
+
+        elapsed=$((SECONDS - start_time))
+        total_time=$((total_time + elapsed))
+        completed_in_this_job=$((completed_in_this_job + 1))
         last_completed_round=$i
 
-        echo -e "Round${i} elapsed: $elapsed seconds"
-        echo -e "current_round=$current_round, last_completed_round=$last_completed_round\n$(date)\n"
-
+        echo "Round $i completed."
+        echo "elapsed=${elapsed}s"
+        echo "last_completed_round=$last_completed_round"
+        echo "finished at $(date)"
     done
 
-    avg_time=$(awk "BEGIN {printf \"%.2f\", $total_time / $last_completed_round}")
+    if (( completed_in_this_job > 0 )); then
+        avg_time=$((total_time / completed_in_this_job))
+        echo "本次 job 完成輪數：$completed_in_this_job"
+        echo "本次 job 平均每輪時間：${avg_time}s"
+    fi
 
-    # if $s1 != 1
-    #     python "${tSDRGpath}/Subpy/combine.py" "${FILE}" 1 "${s2}"
-    python "${tSDRGpath}/Subpy/ave.py" "${FILE}" 1 "${s2}"
+    # 全部輪次完成後，重新對完整範圍取平均
+    python "${tSDRGpath}/Subpy/ave.py" "$FILE" "$s1" "$s2"
+    final_ave_rc=$?
+
+    if (( final_ave_rc != 0 )); then
+        echo "錯誤：最終 ave.py 執行失敗。" >&2
+        exit "$final_ave_rc"
+    fi
 
 else
-    # 否則，執行這段
-    # run_and_print python ${tSDRGpath}/Subpy/combine.py "${FILE}" 1 "${s2}"
-    # run_and_print python ${tSDRGpath}/Subpy/ave.py "${FILE}" 1 "${s2}"
+    echo "task='$task'，不執行 spin 計算，只進行後處理。"
 
-    python ${tSDRGpath}/Subpy/combine.py "${FILE}" 1 "${s2}"
-    python ${tSDRGpath}/Subpy/ave.py "${FILE}" 1 "${s2}"
+    python "${tSDRGpath}/Subpy/combine.py" "$FILE" "$s1" "$s2"
+    combine_rc=$?
+
+    if (( combine_rc != 0 )); then
+        echo "錯誤：combine.py 執行失敗。" >&2
+        exit "$combine_rc"
+    fi
+
+    python "${tSDRGpath}/Subpy/ave.py" "$FILE" "$s1" "$s2"
+    ave_rc=$?
+
+    if (( ave_rc != 0 )); then
+        echo "錯誤：ave.py 執行失敗。" >&2
+        exit "$ave_rc"
+    fi
 fi
-# python /dicos_ui_home/aronton/tSDRG_random/Subpy/combine.py ${FILE}
 
-echo "Job finished $(date)"
+echo "Job finished: $(date)"
